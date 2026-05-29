@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY octopi/ octopi/
+COPY .streamlit/ .streamlit/
 COPY app.py .
 
 EXPOSE 8501
