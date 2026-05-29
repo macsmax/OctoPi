@@ -63,6 +63,16 @@ def fetch_tariff_rates(
     return rates, standing
 
 
+@st.cache_data(ttl=3600)
+def fetch_billing_data(api_key: str, account_number: str) -> dict:
+    client = OctopusClient(api_key, account_number)
+    return {
+        "balance": client.get_balance(),
+        "payments": client.get_payments(),
+        "bills": client.get_bills(),
+    }
+
+
 # Sidebar config
 with st.sidebar:
     st.header("Configuration")
@@ -110,10 +120,155 @@ st.sidebar.write(f"**Electricity meter points:** {len(elec_meter_points)}")
 st.sidebar.write(f"**Gas meter points:** {len(gas_meter_points)}")
 
 # Tabs for electricity and gas
-tabs = st.tabs(["⚡ Electricity", "🔥 Gas", "📊 Billing Summary"])
+tabs = st.tabs(["💷 Paid vs Consumed", "⚡ Electricity", "🔥 Gas", "📊 Billing Summary"])
+
+# --- Paid vs Consumed tab ---
+with tabs[0]:
+    st.subheader("What You Paid vs What You Actually Used")
+
+    try:
+        billing = fetch_billing_data(api_key, account_number)
+    except Exception as e:
+        st.error(f"Failed to fetch billing data: {e}")
+        st.stop()
+
+    balance_data = billing["balance"]
+    payments = billing["payments"]
+    bills = billing["bills"]
+
+    # Current balance
+    balance_pence = balance_data.get("balance", 0)
+    balance_pounds = balance_pence / 100
+    overdue_pounds = balance_data.get("overdueBalance", 0) / 100
+
+    if balance_pounds > 0:
+        st.success(f"### Account Balance: **£{balance_pounds:,.2f} IN CREDIT**")
+    elif balance_pounds < 0:
+        st.error(f"### Account Balance: **£{abs(balance_pounds):,.2f} IN DEBIT**")
+    else:
+        st.info("### Account Balance: £0.00")
+
+    if overdue_pounds > 0:
+        st.warning(f"Overdue: £{overdue_pounds:,.2f}")
+
+    st.divider()
+
+    # Payment summary
+    cleared_payments = [p for p in payments if p.get("status") in ("CLEARED", "PENDING")]
+    total_paid = sum(p["amount"] for p in cleared_payments) / 100
+
+    # Bills summary
+    total_charged = sum((b.get("totalCharges", {}).get("grossTotal", 0) or 0) for b in bills) / 100
+    total_credits = sum((b.get("totalCredits", {}).get("grossTotal", 0) or 0) for b in bills) / 100
+    net_billed = total_charged - total_credits
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Paid", f"£{total_paid:,.2f}", help="All cleared + pending direct debit payments")
+    col2.metric("Total Billed (net)", f"£{net_billed:,.2f}", help="Total charges minus credits applied")
+    col3.metric("Overpayment", f"£{total_paid - net_billed:,.2f}", delta=f"£{total_paid - net_billed:,.2f}", help="Paid minus billed")
+
+    st.divider()
+
+    # Monthly comparison: what you paid vs what was billed vs calculated from readings
+    st.subheader("📊 Monthly: Paid vs Billed vs Calculated from Readings")
+
+    # Build monthly payments
+    payments_df = pd.DataFrame(cleared_payments)
+    if not payments_df.empty:
+        payments_df["date"] = pd.to_datetime(payments_df["paymentDate"])
+        payments_df["month"] = payments_df["date"].dt.to_period("M")
+        payments_df["amount_pounds"] = payments_df["amount"] / 100
+        monthly_payments = payments_df.groupby("month")["amount_pounds"].sum().reset_index()
+        monthly_payments["month_str"] = monthly_payments["month"].astype(str)
+    else:
+        monthly_payments = pd.DataFrame(columns=["month_str", "amount_pounds"])
+
+    # Build monthly bills
+    bills_with_dates = [b for b in bills if b.get("fromDate")]
+    if bills_with_dates:
+        bills_df = pd.DataFrame(bills_with_dates)
+        bills_df["from"] = pd.to_datetime(bills_df["fromDate"])
+        bills_df["month"] = bills_df["from"].dt.to_period("M")
+        bills_df["net_charge"] = bills_df.apply(
+            lambda r: ((r.get("totalCharges") or {}).get("grossTotal", 0) or 0) / 100
+            - ((r.get("totalCredits") or {}).get("grossTotal", 0) or 0) / 100,
+            axis=1,
+        )
+        monthly_bills = bills_df.groupby("month")["net_charge"].sum().reset_index()
+        monthly_bills["month_str"] = monthly_bills["month"].astype(str)
+    else:
+        monthly_bills = pd.DataFrame(columns=["month_str", "net_charge"])
+
+    # Merge for chart
+    all_months_set = set()
+    if not monthly_payments.empty:
+        all_months_set.update(monthly_payments["month_str"].tolist())
+    if not monthly_bills.empty:
+        all_months_set.update(monthly_bills["month_str"].tolist())
+
+    if all_months_set:
+        chart_df = pd.DataFrame({"month_str": sorted(all_months_set)})
+        chart_df = chart_df.merge(
+            monthly_payments[["month_str", "amount_pounds"]].rename(columns={"amount_pounds": "Paid (DD)"}),
+            on="month_str", how="left",
+        ).merge(
+            monthly_bills[["month_str", "net_charge"]].rename(columns={"net_charge": "Billed (net)"}),
+            on="month_str", how="left",
+        ).fillna(0)
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=chart_df["month_str"], y=chart_df["Paid (DD)"], name="Paid (Direct Debit)", marker_color="#22c55e"))
+        fig.add_trace(go.Bar(x=chart_df["month_str"], y=chart_df["Billed (net)"], name="Billed (net charges)", marker_color="#ef4444"))
+        fig.update_layout(barmode="group", height=400, margin=dict(t=10), yaxis_title="£", xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # Cumulative view
+    st.subheader("📈 Cumulative: Running Credit/Debit Over Time")
+
+    if not monthly_payments.empty and not monthly_bills.empty:
+        cumul_df = chart_df.copy()
+        cumul_df["cumul_paid"] = cumul_df["Paid (DD)"].cumsum()
+        cumul_df["cumul_billed"] = cumul_df["Billed (net)"].cumsum()
+        cumul_df["running_balance"] = cumul_df["cumul_paid"] - cumul_df["cumul_billed"]
+
+        fig_cumul = go.Figure()
+        fig_cumul.add_trace(go.Scatter(x=cumul_df["month_str"], y=cumul_df["cumul_paid"], name="Cumulative Paid", line=dict(color="#22c55e", width=2)))
+        fig_cumul.add_trace(go.Scatter(x=cumul_df["month_str"], y=cumul_df["cumul_billed"], name="Cumulative Billed", line=dict(color="#ef4444", width=2)))
+        fig_cumul.add_trace(go.Scatter(x=cumul_df["month_str"], y=cumul_df["running_balance"], name="Balance (credit/debit)", line=dict(color="#6366f1", width=3), fill="tozeroy"))
+        fig_cumul.add_hline(y=0, line_dash="dash", line_color="gray")
+        fig_cumul.update_layout(height=400, margin=dict(t=10), yaxis_title="£", xaxis_tickangle=-45)
+        st.plotly_chart(fig_cumul, use_container_width=True)
+
+    st.divider()
+
+    # Payment history table
+    st.subheader("💳 Payment History")
+    if cleared_payments:
+        pay_table = pd.DataFrame(cleared_payments)[["paymentDate", "amount", "status"]].copy()
+        pay_table["amount"] = pay_table["amount"].apply(lambda x: f"£{x/100:.2f}")
+        pay_table.columns = ["Date", "Amount", "Status"]
+        st.dataframe(pay_table, use_container_width=True, hide_index=True)
+
+    # Bills table
+    st.subheader("📄 Bill History")
+    if bills_with_dates:
+        bill_rows = []
+        for b in bills_with_dates:
+            charges = (b.get("totalCharges", {}).get("grossTotal", 0) or 0) / 100
+            credits = (b.get("totalCredits", {}).get("grossTotal", 0) or 0) / 100
+            bill_rows.append({
+                "Period": f"{b['fromDate']} → {b['toDate']}",
+                "Charges": f"£{charges:.2f}",
+                "Credits": f"£{credits:.2f}",
+                "Net": f"£{charges - credits:.2f}",
+                "Issued": b.get("issuedDate", ""),
+            })
+        st.dataframe(pd.DataFrame(bill_rows), use_container_width=True, hide_index=True)
 
 for tab_idx, (tab, fuel, meter_points) in enumerate(
-    zip(tabs[:2], ["electricity", "gas"], [elec_meter_points, gas_meter_points])
+    zip(tabs[1:3], ["electricity", "gas"], [elec_meter_points, gas_meter_points])
 ):
     with tab:
         if not meter_points:
@@ -358,7 +513,7 @@ for tab_idx, (tab, fuel, meter_points) in enumerate(
         )
 
 # Billing Summary tab
-with tabs[2]:
+with tabs[3]:
     st.subheader("📋 Billing Evidence Summary")
     st.markdown("Use this information when contacting Octopus Energy about your billing dispute.")
 
