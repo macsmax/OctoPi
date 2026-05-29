@@ -2,6 +2,9 @@
 
 Verify your Octopus Energy billing by comparing smart meter consumption data against tariff rates.
 
+![Paid vs Consumed](assets/screenshot-1.png)
+![Electricity Data Coverage](assets/screenshot-2.png)
+
 ## What it does
 
 - Pulls half-hourly consumption data from the Octopus Energy API (electricity + gas)
