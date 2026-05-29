@@ -1,0 +1,9 @@
+services:
+  octopi:
+    build: .
+    container_name: octopi
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
