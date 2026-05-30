@@ -612,10 +612,22 @@ if EV_ENABLED:
                 y=monthly_ev["kwh"],
                 name="kWh Charged",
                 marker_color="#22c55e",
+                yaxis="y",
+            ))
+            fig_ev.add_trace(go.Scatter(
+                x=monthly_ev["month_str"],
+                y=monthly_ev["cost"],
+                name="Cost (£)",
+                line=dict(color="#f97316", width=3),
+                mode="lines+markers",
+                yaxis="y2",
             ))
             fig_ev.update_layout(
                 height=350, margin=dict(t=10),
-                yaxis_title="kWh", xaxis_title="Month", xaxis_tickangle=-45,
+                xaxis_title="Month", xaxis_tickangle=-45,
+                yaxis=dict(title="kWh", side="left"),
+                yaxis2=dict(title="Cost (£)", side="right", overlaying="y", showgrid=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
             )
             st.plotly_chart(fig_ev, use_container_width=True)
 
