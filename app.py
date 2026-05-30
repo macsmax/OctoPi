@@ -120,7 +120,12 @@ st.sidebar.write(f"**Electricity meter points:** {len(elec_meter_points)}")
 st.sidebar.write(f"**Gas meter points:** {len(gas_meter_points)}")
 
 # Tabs for electricity and gas
-tabs = st.tabs(["💷 Paid vs Consumed", "⚡ Electricity", "🔥 Gas", "📊 Billing Summary"])
+EV_ENABLED = os.getenv("EV_CHARGING", "false").lower() in ("true", "1", "yes")
+tab_labels = ["💷 Paid vs Consumed", "⚡ Electricity", "🔥 Gas"]
+if EV_ENABLED:
+    tab_labels.append("🚗 EV Charging")
+tab_labels.append("📊 Billing Summary")
+tabs = st.tabs(tab_labels)
 
 # --- Paid vs Consumed tab ---
 with tabs[0]:
@@ -512,8 +517,172 @@ for tab_idx, (tab, fuel, meter_points) in enumerate(
             help=f"Based on {total_kwh:.0f} kWh consumed × tariff rate + standing charges (only months with actual data)",
         )
 
+# EV Charging tab
+if EV_ENABLED:
+    ev_tab_idx = tab_labels.index("🚗 EV Charging")
+    with tabs[ev_tab_idx]:
+        st.subheader("🚗 EV Charging Analysis")
+
+        charger_kw = float(os.getenv("EV_CHARGER_KW", "7"))
+        # Threshold: half the charger rate per 30-min slot (accounting for losses)
+        ev_threshold = charger_kw * 0.5 * 0.7  # 70% of theoretical max per slot
+
+        # Fetch EV device info
+        try:
+            client = OctopusClient(api_key, account_number)
+            ev_devices = client.get_ev_devices()
+            if ev_devices:
+                dev = ev_devices[0]
+                st.success(f"**{dev['provider']}** registered on Intelligent Octopus ({dev['status']['current']})")
+            else:
+                st.info("No EV device registered with Intelligent Octopus")
+        except Exception:
+            pass
+
+        st.divider()
+
+        # Home charging: detect from off-peak consumption spikes
+        st.subheader("🏠 Home Charging (from meter data)")
+        st.caption(f"Detecting slots with >{ev_threshold:.1f} kWh/30min during off-peak hours (23:30–05:30)")
+
+        # Combine all electricity data
+        all_elec_readings = []
+        if elec_meter_points:
+            emp = elec_meter_points[0]
+            history_from_ev = datetime(2023, 4, 10)
+            history_to_ev = datetime.now()
+            for meter in emp.get("meters", []):
+                readings = fetch_consumption(
+                    api_key, account_number, "electricity",
+                    emp["mpan"], meter["serial_number"],
+                    history_from_ev, history_to_ev,
+                )
+                all_elec_readings.extend(readings)
+
+        if all_elec_readings:
+            ev_df = consumption_to_dataframe(all_elec_readings)
+            ev_df = ev_df.drop_duplicates(subset=["interval_start"]).sort_values("interval_start").reset_index(drop=True)
+
+            # Identify off-peak hours (22:30-04:30 UTC = 23:30-05:30 BST)
+            ev_df["hour_utc"] = ev_df["interval_start"].dt.hour
+            ev_df["minute_utc"] = ev_df["interval_start"].dt.minute
+            ev_df["is_offpeak"] = (
+                (ev_df["hour_utc"] >= 23) |
+                (ev_df["hour_utc"] < 5) |
+                ((ev_df["hour_utc"] == 22) & (ev_df["minute_utc"] >= 30))
+            )
+
+            # Off-peak high-draw = likely EV charging
+            ev_charging = ev_df[ev_df["is_offpeak"] & (ev_df["consumption"] > ev_threshold)].copy()
+            ev_charging["month"] = ev_charging["interval_start"].dt.tz_localize(None).dt.to_period("M")
+
+            # Get off-peak rate
+            offpeak_rate = 7.0  # p/kWh default for Intelligent Octopus
+            try:
+                rates = client.get_tariff_rates(
+                    "INTELLI-VAR-22-10-14", "E-1R-INTELLI-VAR-22-10-14-J", "electricity"
+                )
+                if rates:
+                    offpeak_rates = [r for r in rates if r.get("value_inc_vat", 99) < 15]
+                    if offpeak_rates:
+                        offpeak_rate = offpeak_rates[0]["value_inc_vat"]
+            except Exception:
+                pass
+
+            total_ev_kwh = ev_charging["consumption"].sum()
+            total_ev_cost = total_ev_kwh * offpeak_rate / 100
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Home Charged", f"{total_ev_kwh:,.0f} kWh")
+            col2.metric("Cost (off-peak)", f"£{total_ev_cost:,.2f}")
+            col3.metric("Off-peak Rate", f"{offpeak_rate:.2f}p/kWh")
+            col4.metric("Charging Sessions", f"{len(ev_charging):,} slots")
+
+            # Monthly home charging chart
+            monthly_ev = ev_charging.groupby("month").agg(
+                kwh=("consumption", "sum"),
+                sessions=("consumption", "count"),
+            ).reset_index()
+            monthly_ev["month_str"] = monthly_ev["month"].astype(str)
+            monthly_ev["cost"] = monthly_ev["kwh"] * offpeak_rate / 100
+
+            fig_ev = go.Figure()
+            fig_ev.add_trace(go.Bar(
+                x=monthly_ev["month_str"],
+                y=monthly_ev["kwh"],
+                name="kWh Charged",
+                marker_color="#22c55e",
+            ))
+            fig_ev.update_layout(
+                height=350, margin=dict(t=10),
+                yaxis_title="kWh", xaxis_title="Month", xaxis_tickangle=-45,
+            )
+            st.plotly_chart(fig_ev, use_container_width=True)
+
+            # Monthly breakdown table
+            ev_table = monthly_ev[["month_str", "kwh", "cost", "sessions"]].copy()
+            ev_table.columns = ["Month", "kWh Charged", "Cost (£)", "Slots"]
+            ev_table["kWh Charged"] = ev_table["kWh Charged"].round(1)
+            ev_table["Cost (£)"] = ev_table["Cost (£)"].round(2)
+            st.dataframe(ev_table, use_container_width=True, hide_index=True)
+
+        else:
+            st.warning("No electricity data available to detect home charging.")
+
+        st.divider()
+
+        # Electroverse
+        st.subheader("⚡ Electroverse (public charging)")
+
+        try:
+            ev_transactions = client.get_electroverse_transactions()
+
+            if ev_transactions:
+                total_electroverse = sum(t["amounts"]["gross"] for t in ev_transactions) / 100
+
+                col1, col2 = st.columns(2)
+                col1.metric("Electroverse Sessions", len(ev_transactions))
+                col2.metric("Total Electroverse Spend", f"£{total_electroverse:.2f}")
+
+                ev_rows = []
+                for t in ev_transactions:
+                    ev_rows.append({
+                        "Date": t["postedDate"],
+                        "Cost": f"£{t['amounts']['gross'] / 100:.2f}",
+                        "Note": t.get("note") or "",
+                    })
+
+                st.dataframe(pd.DataFrame(ev_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No Electroverse charging sessions found.")
+        except Exception as e:
+            st.warning(f"Could not fetch Electroverse data: {e}")
+
+        st.divider()
+
+        # Total EV costs summary
+        st.subheader("💰 Total EV Charging Costs")
+        home_cost = total_ev_cost if all_elec_readings else 0
+        electroverse_cost = total_electroverse if ev_transactions else 0
+        total_all_ev = home_cost + electroverse_cost
+
+        fig_pie = go.Figure(data=[go.Pie(
+            labels=["Home (off-peak)", "Electroverse (public)"],
+            values=[home_cost, electroverse_cost],
+            marker_colors=["#22c55e", "#6366f1"],
+            hole=0.4,
+        )])
+        fig_pie.update_layout(height=300, margin=dict(t=10, b=10))
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+        st.metric("Total EV Charging Cost", f"£{total_all_ev:.2f}")
+        if total_ev_kwh > 0:
+            avg_cost_per_kwh = total_all_ev / total_ev_kwh * 100
+            avg_cost_per_mile = total_all_ev / (total_ev_kwh * 3.5)  # ~3.5 mi/kWh for Tesla
+            st.caption(f"Average: {avg_cost_per_kwh:.1f}p/kWh | ~£{avg_cost_per_mile:.2f}/mile (estimated)")
+
 # Billing Summary tab
-with tabs[3]:
+with tabs[-1]:
     st.subheader("📋 Billing Evidence Summary")
     st.markdown("Use this information when contacting Octopus Energy about your billing dispute.")
 

@@ -252,3 +252,25 @@ class OctopusClient:
                 break
             cursor = page["pageInfo"]["endCursor"]
         return transactions
+
+    def get_ev_devices(self) -> list[dict]:
+        query = """
+        query {
+            devices(accountNumber: "%s") {
+                id
+                deviceType
+                provider
+                status { current }
+            }
+        }
+        """ % self.account_number
+        data = self._graphql_request(query)
+        return [d for d in data.get("devices", []) if d.get("deviceType") == "ELECTRIC_VEHICLES"]
+
+    def get_electroverse_transactions(self) -> list[dict]:
+        """Get all Electroverse charging transactions."""
+        all_txns = self.get_transactions()
+        return [
+            t for t in all_txns
+            if t.get("title") and "electroverse" in t["title"].lower()
+        ]
